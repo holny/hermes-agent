@@ -70,7 +70,7 @@ def _cfgset_model_ok(rid, key, value, warning="", confirm_message="", scope="ses
                confirm_message=confirm_message, scope=scope, **extra)
 
 
-def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed):
+def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed, sid=""):
     """No live swap while a turn streams (agent.switch_model() mutates fields the worker thread
     reads every iteration): stash the pick for the NEXT turn start. Selection guards run HERE (the
     only moment a confirm round-trip is possible; an unconfirmed stashed pick is dropped at turn
@@ -92,6 +92,9 @@ def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed):
     session["pending_model_switch"] = {
         "raw": value, "confirm_expensive_model": confirmed,
         "display_model": pending_model, "display_provider": pending_provider}
+    # The pill is server-truth: without this emit the queued pick stays invisible until the
+    # deferred switch lands a turn later, which reads as a dead click (#141027).
+    _emit_session_info(sid, session)
     return _cfgset_model_ok(rid, key, pending_model, deferred=True)
 
 
@@ -124,7 +127,7 @@ def _set_model(rid, params, key, value, session):
         # model. The stash crosses the boundary in the turn frame and the child's
         # turn thread applies it (_apply_pending_model_switch).
         if session.get("running") or session.get("_compute_host_active"):
-            return _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags)
+            return _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags, sid=sid)
         explicit_provider = parsed_flags.explicit_provider
         failed_agent_init = session.get("agent") is None and session.get("agent_error") is not None
         failed_ready = session.get("agent_ready") if failed_agent_init else None
