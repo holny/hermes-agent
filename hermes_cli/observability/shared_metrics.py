@@ -47,6 +47,11 @@ _DAILY_ONCE_STATE_PREFIX = "daily_once:"
 _ACTIVE_INSTALL_INTERVAL = timedelta(hours=24)
 # Column order of the client resource in every counter_aggregates statement.
 _RESOURCE_COLUMNS = ("hermes_version", "os_family", "architecture", "install_method")
+# Same markers the kanban dispatcher treats as "the file itself is unusable": a mangled
+# header or malformed image fails every statement, so only a quarantine + rebuild recovers.
+_CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
+# Quarantined copies kept for forensics; older ones are deleted on the next quarantine.
+_QUARANTINED_COPIES_KEPT = 5
 
 _CREATE_TELEMETRY_STATE_SQL = """
             CREATE TABLE IF NOT EXISTS telemetry_state (
@@ -501,6 +506,44 @@ class SharedMetricsStore:
                 yield connection
 
     def _ensure_schema(self) -> None:
+        try:
+            self._ensure_schema_once()
+        except sqlite3.DatabaseError as exc:
+            # A mangled header never heals by itself: without this branch every
+            # process opening the store raises on first touch and telemetry stays
+            # down until a human quarantines the file. Rebuild once and let a
+            # second failure propagate — a fresh create cannot hit the same
+            # corruption twice, so this never loops.
+            if not any(marker in str(exc).lower() for marker in _CORRUPT_DB_MARKERS):
+                raise
+            self._quarantine_corrupt_database(exc)
+            self._ensure_schema_once()
+
+    def _quarantine_corrupt_database(self, exc: Exception) -> None:
+        path = self.database_path
+        stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+        quarantined = path.with_name(f"{path.name}.corrupt_{stamp}")
+        try:
+            path.replace(quarantined)
+        except FileNotFoundError:
+            # A sibling process quarantined (or already rebuilt) it; rebuild too.
+            pass
+        for suffix in ("-wal", "-shm", "-journal"):
+            # The sidecars belong to the quarantined file; left behind they would
+            # be replayed onto the freshly created database.
+            path.with_name(path.name + suffix).unlink(missing_ok=True)
+        logger.warning(
+            "Shared-metrics store is corrupt (%s); quarantined as %s and rebuilding it",
+            exc, quarantined.name,
+        )
+        stale = sorted(path.parent.glob(f"{path.name}.corrupt_*"))[:-_QUARANTINED_COPIES_KEPT]
+        for old in stale:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def _ensure_schema_once(self) -> None:
         # Serialize first-run creation and upgrades across Hermes processes.
         with self._write(busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS) as connection:
             connection.execute(_CREATE_TELEMETRY_STATE_SQL)
