@@ -6785,6 +6785,10 @@ def _define_discord_view_classes() -> None:
             await self._edit(interaction, t("platform.discord.picker.cancelled"), color=discord.Color.greyple())
 
         async def on_timeout(self):
+            if self.resolved:
+                # A switch or cancel already finalized this picker's message; the
+                # grey expiry embed must not overwrite the green/cancelled record.
+                return
             self.resolved = True
             self.clear_items()
             msg = self._message
