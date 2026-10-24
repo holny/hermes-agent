@@ -1013,12 +1013,21 @@ class GatewayBusySessionMixin:
     )
 
     def _command_handler_table(self, names) -> dict[str, Any]:
-        return {
-            name: getattr(
-                self, self._COMMAND_HANDLER_ALIASES.get(name, f"_handle_{name.replace('-', '_')}_command"),
+        # A name listed without a resolvable handler degrades to "not a command" (the dispatch
+        # fall-through) instead of AttributeError-ing every inbound message; drift is caught by
+        # the class-level test over _PLAIN_COMMANDS/_IDLE_COMMANDS. See #143844.
+        table: dict[str, Any] = {}
+        for name in names:
+            handler = getattr(
+                self,
+                self._COMMAND_HANDLER_ALIASES.get(
+                    name, f"_handle_{name.replace('-', '_')}_command"
+                ),
+                None,
             )
-            for name in names
-        }
+            if handler is not None:
+                table[name] = handler
+        return table
 
     def _gateway_plain_command_handlers(self):
         """Return ordinary slash handlers shared by idle and busy dispatch."""
