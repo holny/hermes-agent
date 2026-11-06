@@ -935,6 +935,242 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    _SESSIONS_HEAL_DDL = """CREATE TABLE sessions_pk_heal_new (
+    id TEXT PRIMARY KEY,
+    runtime_revision INTEGER NOT NULL DEFAULT 0,
+    runtime_generation INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL,
+    created_source TEXT,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    git_metadata_generation INTEGER NOT NULL DEFAULT 0,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    title_source TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    compression_recovery_deadline REAL,
+    compression_overload_streak INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    transport_profile TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    auto_archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
+    tool_names TEXT,
+    transcript_revision INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)"""
+
+    _SESSIONS_HEAL_INDEX_SQL = (
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique ON sessions(title) "
+        "WHERE title IS NOT NULL",
+    )
+
+    _MESSAGES_HEAL_DDL = """CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT,
+    effect_disposition TEXT,
+    timestamp REAL NOT NULL,
+    token_count INTEGER,
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_content TEXT,
+    reasoning_details TEXT,
+    codex_reasoning_items TEXT,
+    codex_message_items TEXT,
+    platform_message_id TEXT,
+    observed INTEGER DEFAULT 0,
+    _compressed_summary INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0,
+    api_content TEXT,
+    display_kind TEXT,
+    display_metadata TEXT,
+    display_identity BLOB,
+    display_order INTEGER,
+    message_uid TEXT,
+    absorbed_message_uids TEXT,
+    tool_call_uids TEXT,
+    tool_call_uid TEXT
+)"""
+
+    _MESSAGES_HEAL_INDEX_SQL = (
+        "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session "
+        "ON messages(session_id) WHERE role = 'assistant' AND tool_calls IS NOT NULL",
+    )
+
+    def _sessions_heal_columns(self):
+        """Copy column list for the sessions heal, in DDL order (the reconciler has already
+        ADDed every SCHEMA_SQL column to the legacy table, so the list always resolves)."""
+        return [line.split()[0] for line in self._SESSIONS_HEAL_DDL.splitlines()
+                if line.startswith("    ") and not line.lstrip().startswith(("FOREIGN", "PRIMARY"))]
+
+    def _heal_sessions_pk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild ``sessions`` when its ``id`` predates ``TEXT PRIMARY KEY`` (legacy bare
+        column): ``create_session``'s ``ON CONFLICT(id)`` upsert fails ("does not match any
+        PRIMARY KEY or UNIQUE constraint") and nothing enforces session-id uniqueness (#148742).
+        Ids are preserved verbatim; on a legacy duplicate the newest row (highest rowid) wins,
+        the same policy as the gateway_routing heal.
+
+        Rename-LAST discipline, unlike ``_rebuild_table``: messages, session_model_usage and
+        session_admissions all carry FK clauses naming ``sessions``, and an ALTER RENAME would
+        rewrite them toward the legacy copy whose final DROP then leaves them dangling — so the
+        fresh table is created under a scratch name, populated, the legacy table dropped, and
+        only then renamed onto the name every child FK already says. One BEGIN IMMEDIATE
+        transaction, same sibling-race reasoning as ``_rebuild_table``. FK-off window: the
+        children reference the table being dropped."""
+        pk_cols = self._live_pk_columns(cursor, "sessions")
+        if pk_cols:
+            return
+        logger.info("sessions has no PRIMARY KEY on id (legacy bare column); rebuilding with TEXT PRIMARY KEY")
+        cols = self._sessions_heal_columns()
+        col_list = ", ".join(cols)
+        conn = cursor.connection
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(self._SESSIONS_HEAL_DDL)
+                cursor.execute(
+                    f"INSERT OR REPLACE INTO sessions_pk_heal_new ({col_list}) "
+                    f"SELECT {col_list} FROM sessions ORDER BY rowid ASC"
+                )
+                # Views and cross-table triggers referencing sessions block its DROP (SQLite
+                # re-validates the whole schema): the trigram projection JOINs sessions and the
+                # trigram triggers probe it in their WHEN clauses. The post-heal FTS ensure
+                # (_ensure_fts_schema) and DEFERRED_INDEX_SQL recreate every one of these.
+                cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+                for name in ("messages_fts_trigram_insert", "messages_fts_trigram_delete",
+                             "messages_fts_trigram_update", "messages_transcript_revision_update"):
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+                cursor.execute("DROP TABLE sessions")
+                cursor.execute("ALTER TABLE sessions_pk_heal_new RENAME TO sessions")
+                for sql in self._SESSIONS_HEAL_INDEX_SQL:
+                    cursor.execute(sql)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        except sqlite3.OperationalError as exc:
+            logger.debug("sessions PK heal skipped: %s", exc)
+        finally:
+            cursor.execute("PRAGMA foreign_keys=ON")
+
+    def _heal_messages_pk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild ``messages`` when its ``id`` predates ``INTEGER PRIMARY KEY`` (legacy bare
+        column): ``append_message`` omits ``id``, so every insert stores NULL, ids and rowids
+        drift apart until the compaction split's ``int(row["id"])`` crashes and indexing walks
+        skip the rows (#148742).
+
+        The copy preserves integer ids verbatim — ``messages_fts`` is external content keyed by
+        ``content_rowid='id'`` (through ``messages_fts_src``), so renumbering healthy rows would
+        desync the index — and remaps every non-integer id (NULL/text/real) to
+        ``max(preserved integer ids) + rowid``: strictly above every preserved id and unique per
+        rowid, so no UNIQUE collision regardless of legacy id litter.
+
+        Rename-LAST discipline, same as the sessions heal: an ALTER RENAME would rewrite the
+        ``messages_fts_src`` view body toward the legacy copy whose final DROP then leaves the
+        FTS projection dangling. FK-off window: messages references sessions(id)."""
+        pk_cols = self._live_pk_columns(cursor, "messages")
+        if pk_cols:
+            return
+        logger.info("messages has no PRIMARY KEY on id (legacy bare column); rebuilding with INTEGER PRIMARY KEY")
+        base = cursor.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE typeof(id) = 'integer'"
+        ).fetchone()[0]
+        cols = self._messages_heal_columns()
+        col_list = ", ".join(cols)
+        select_list = ", ".join([
+            f"CASE WHEN typeof(id) = 'integer' THEN id ELSE {int(base)} + rowid END", *cols[1:],
+        ])
+        conn = cursor.connection
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(self._MESSAGES_HEAL_DDL.replace(
+                    "CREATE TABLE messages (", "CREATE TABLE messages_pk_heal_new (", 1))
+                cursor.execute(
+                    f"INSERT INTO messages_pk_heal_new ({col_list}) "
+                    f"SELECT {select_list} FROM messages ORDER BY rowid"
+                )
+                # Both FTS projections read messages and a view dependency blocks the DROP;
+                # the post-heal FTS ensure recreates them from FTS_SQL/FTS_TRIGRAM_SQL.
+                cursor.execute("DROP VIEW IF EXISTS messages_fts_src")
+                cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+                cursor.execute("DROP TABLE messages")
+                cursor.execute("ALTER TABLE messages_pk_heal_new RENAME TO messages")
+                for sql in self._MESSAGES_HEAL_INDEX_SQL:
+                    cursor.execute(sql)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        except sqlite3.OperationalError as exc:
+            logger.debug("messages PK heal skipped: %s", exc)
+        finally:
+            cursor.execute("PRAGMA foreign_keys=ON")
+
+    def _messages_heal_columns(self):
+        """Copy column list for the messages heal, in DDL order."""
+        return [line.split()[0] for line in self._MESSAGES_HEAL_DDL.splitlines()
+                if line.startswith("    ") and not line.lstrip().startswith(("FOREIGN", "PRIMARY"))]
+
     # ── _init_schema ───────────────────────────────────────────────────────
 
     def _init_schema(self):
@@ -962,6 +1198,12 @@ class SessionSchemaMixin:
         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+        # Rebuild sessions/messages when their PRIMARY KEY predates the shipped shape (bare ``id``
+        # column from legacy builds): create_session's ``ON CONFLICT(id)`` upsert fails on a bare
+        # sessions.id, and append_message's omitted id stores NULL on a bare messages.id until the
+        # compaction split crashes (#148742). Same PK-rebuild constraint as the heals above.
+        self._heal_sessions_pk(cursor)
+        self._heal_messages_pk(cursor)
 
         # Indexes referencing reconciler-added columns must be created AFTER _reconcile_columns
         # (in SCHEMA_SQL the executescript would fail on legacy DBs).
