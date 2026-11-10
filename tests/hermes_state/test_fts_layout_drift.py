@@ -509,3 +509,48 @@ def test_the_follow_up_notice_makes_no_size_or_effort_claim(v1_trigram_db, monke
     out = _notice_for(v1_trigram_db, monkeypatch)
     assert heading in out
     assert "%" not in out and "smaller" not in out.lower()
+
+
+def test_an_empty_pre_v3_home_opens_without_a_dead_savepoint(tmp_path):
+    """Regression for #121882: an unused pre-v3 home (0 messages, raw-messages base index) blew
+    up on open — the empty-home realign wrapped the DDL in a SAVEPOINT, and ``executescript``'s
+    implicit COMMIT destroyed that savepoint before RELEASE ran, so the handler's own ROLLBACK
+    raised and masked the swap. Opening must realign in place and stamp current instead."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db._conn.executescript("DELETE FROM messages;")
+    db._conn.execute("UPDATE state_meta SET value = '1' WHERE key = 'fts_storage_version'")
+    db._conn.commit()
+    db.close()
+    _install_raw_messages_base_on_path(db_path)
+
+    db = SessionDB(db_path=db_path)
+    try:
+        assert _stamp(db_path) == str(hermes_state_common.FTS_STORAGE_VERSION)
+        shape = db._conn.execute("SELECT sql FROM sqlite_master WHERE name = 'messages_fts'").fetchone()[0]
+        assert "'messages_fts_src'" in shape
+        assert db._conn.execute("SELECT count(*) FROM messages_fts").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def _install_raw_messages_base_on_path(db_path: pathlib.Path) -> None:
+    """Downgrade a closed store to the pre-v3 base: external-content FTS over raw ``messages``."""
+    conn = sqlite3.connect(db_path)
+    try:
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN "
+            "('messages_fts_insert','messages_fts_delete','messages_fts_update')")]
+        conn.executescript(
+            "".join(f"DROP TRIGGER IF EXISTS {n};" for n in names)
+            + """
+            DROP TABLE messages_fts;
+            DROP VIEW IF EXISTS messages_fts_src;
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content, tool_name, tool_calls, content='messages', content_rowid='id'
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
