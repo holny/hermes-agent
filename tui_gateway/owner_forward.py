@@ -66,6 +66,15 @@ class OwnerUnconfirmed(OwnerUnavailable):
     may still be (or already be) queued there: never "nothing was sent", never a retry."""
 
 
+def _bare_stop_phrase(text: str) -> bool:
+    """A bare stop phrase typed as a busy correction stops the turn and reaches no agent (TUI-26)."""
+    try:
+        from tools.voice_mode_transcript import is_voice_stop_phrase
+        return is_voice_stop_phrase(text)
+    except Exception:  # an unreadable voice config never turns the message into a stop
+        return False
+
+
 def discover_owner(home: Path):
     """The ready gateway endpoint serving ``home``. Discovery only: never starts one."""
     from hermes_cli.gateway_runtime import discover_gateway_endpoint
@@ -139,11 +148,18 @@ class _Relay:
         async with connect_owner(self.home, self.endpoint) as client:
             attached = await client.rpc("session.resume", session_id=self.key)
             target = str(attached.get("session_id") or self.key)
-            receipt = await self._submit(client, target)
+            receipt = await self._submit(client, target, attached)
             if receipt.get("voice_stopped") is True:
-                # TUI-26: the owner took a typed stop phrase as the end of its LOCAL voice chat and
-                # admitted nothing: there is no turn to relay.
+                # The owner consumed the words as a stop (TUI-26): nothing was admitted to relay.
                 self.admitted.set_result(receipt)
+                return
+            if receipt.get("status") in ("steered", "redirected"):
+                # The words joined the owner's RUNNING turn; there is no admission of our own, so the
+                # relay follows that turn's frames and its completion settles the Desktop bubble.
+                self.admitted.set_result(receipt)
+                logger.info("forwarded Desktop prompt for %s into the owner's running turn: %s",
+                            self.key, receipt["status"])
+                await self._relay(client, None)
                 return
             admission_id = receipt.get("admission_id")
             if not isinstance(admission_id, str) or receipt.get("status") not in ("queued", "started", "terminal"):
@@ -153,12 +169,70 @@ class _Relay:
                         self.key, admission_id)
             await self._relay(client, admission_id)
 
-    async def _submit(self, client, target: str) -> dict:
-        """``prompt.submit`` on the owner. Once the request is handed to the socket, only a received
-        refusal the owner raises before its write (``_REFUSED_BEFORE_COMMIT``) proves nothing was
-        queued: a lost connection, a missing answer or any other error may follow the owner's durable
-        commit (a gateway restart mid-forward, a storage error publishing the pending list), so it is
-        unconfirmed, never "nothing was sent" (a resend would run a second copy)."""
+    async def _owner_busy_mode(self, client, target: str) -> str | None:
+        """The owner's effective busy mode for this session (its ``config.get 'busy'`` answer)."""
+        try:
+            answer = await client.rpc("config.get", session_id=target, key="busy")
+        except Exception:
+            return None  # an unreadable mode falls back to today's FIFO admission
+        value = answer.get("value") if isinstance(answer, dict) else None
+        return value if value in ("interrupt", "steer", "queue") else None
+
+    @staticmethod
+    def _live_turn(attached: dict) -> bool:
+        """The owner holds a turn a correction can join (the resume projection's ``running`` flag);
+        a generation is needed to fence it."""
+        return attached.get("running") is True and isinstance(attached.get("execution_generation"), int)
+
+    async def _correct(self, client, target: str, generation: int, mode: str) -> dict | None:
+        """Apply the owner's own busy policy to the forwarded words instead of queueing them behind
+        the turn they were meant to reach. A bare stop phrase in a non-queue mode stops the turn and
+        reaches no agent (TUI-26); ``steer`` joins the running turn; ``interrupt`` hands the words to
+        the owner's atomic redirect. ``None``: nothing live took them — readmit as the next prompt
+        (the same fallback an idle-steer refusal gets), never a silent drop."""
+        from hermes_cli.gateway_client import GatewayRPCError
+        if _bare_stop_phrase(self.text):
+            try:
+                await client.rpc("session.interrupt", session_id=target, execution_generation=generation)
+            except GatewayRPCError as exc:
+                reason = exc.data.get("reason", str(exc))
+                raise OwnerUnavailable(f"the gateway refused the stop: {reason}") from exc
+            return {"voice_stopped": True}
+        verb = "session.steer" if mode == "steer" else "session.redirect"
+        try:
+            answer = await client.rpc(verb, session_id=target, text=self.text, execution_generation=generation)
+        except GatewayRPCError as exc:
+            if exc.data.get("reason") == "stale_generation":
+                return None  # the turn ended while we attached: queue instead
+            reason = exc.data.get("reason", str(exc))
+            raise OwnerUnavailable(f"the gateway refused the correction: {reason}") from exc
+        status = answer.get("status") if isinstance(answer, dict) else None
+        # The owner's correction acks say ``queued`` (steer) / ``redirected``; this relay's receipt
+        # names both outcomes ``steered`` / ``redirected`` for the serve-side prompt answer.
+        mapped = {"queued": "steered", "redirected": "redirected"}.get(status)
+        if mapped is not None:
+            return {"status": mapped}
+        if status == "rejected" and answer.get("delivered") is False:
+            return None  # no live agent took it: the words become the next prompt
+        raise OwnerUnavailable("the running turn did not take the message")
+
+    async def _submit(self, client, target: str, attached: dict) -> dict:
+        """Route the words by the owner's own busy policy. A live turn in the session's ``steer`` /
+        ``interrupt`` mode joins the turn (or, for a stop phrase, ends it); ``queue`` — or a turn
+        that ended, or an unreadable mode — keeps today's durable FIFO admission. Once a request is
+        handed to the socket, only a received refusal the owner raises before its write
+        (``_REFUSED_BEFORE_COMMIT``) proves nothing was queued: a lost connection, a missing answer
+        or any other error may follow the owner's durable commit (a gateway restart mid-forward, a
+        storage error publishing the pending list), so it is unconfirmed, never "nothing was sent"
+        (a resend would run a second copy)."""
+        mode = await self._owner_busy_mode(client, target)
+        if mode in ("interrupt", "steer") and self._live_turn(attached):
+            correction = await self._correct(client, target, attached["execution_generation"], mode)
+            if correction is not None:
+                return correction
+        return await self._admit(client, target)
+
+    async def _admit(self, client, target: str) -> dict:
         from hermes_cli.gateway_client import GatewayRPCError
         try:
             return await client.rpc("prompt.submit", session_id=target, text=self.text,
@@ -170,11 +244,12 @@ class _Relay:
                 raise
             raise OwnerUnconfirmed("the gateway did not confirm it") from exc
 
-    def _pending(self, params: dict, admission_id: str) -> None:
+    def _pending(self, params: dict, admission_id: str | None) -> None:
         """The owner's pending list as this wire's ``pending_submissions``, this admission only: the
-        Desktop's queued-row card while it waits, retired once the owner starts it."""
+        Desktop's queued-row card while it waits, retired once the owner starts it. A steered
+        correction has no pending row of its own; the card is left alone."""
         rows = (params.get("payload") or {}).get("pending")
-        if not isinstance(rows, list):
+        if not isinstance(rows, list) or admission_id is None:
             return
         listed = [{"admission_id": admission_id, "status": "queued", "user": self.text, "input_id": self.request_id}
                   for row in rows if isinstance(row, dict) and row.get("admission_id") == admission_id
@@ -183,7 +258,10 @@ class _Relay:
             self.listed = listed
             self.emit("session.info", self.sid, {"stored_session_id": self.key, "pending_submissions": listed})
 
-    async def _relay(self, client, admission_id: str) -> None:
+    async def _relay(self, client, admission_id: str | None) -> None:
+        """Relay the owner's turn frames onto this Desktop session. With an ``admission_id`` only
+        THAT admission's frames settle; ``None`` (a steered correction joined a turn admitted by
+        someone else) settles on the running turn's own completion."""
         settled = False
         try:
             async with asyncio.timeout(RELAY_TIMEOUT_S):
@@ -201,7 +279,7 @@ class _Relay:
                     if params.get("type") == "session.info":
                         self._pending(params, admission_id)
                         continue
-                    if params.get("admission_id") != admission_id:
+                    if admission_id is not None and params.get("admission_id") != admission_id:
                         continue
                     event_type = params.get("type")
                     if event_type not in _RELAYED:

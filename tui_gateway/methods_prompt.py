@@ -758,7 +758,10 @@ def _submit_to_ledger_owner(rid, sid, session, text, params, refusal) -> dict:
             why = str(exc) if isinstance(exc, owner_forward.OwnerUnavailable) else "the gateway refused it"
         else:
             if receipt.get("voice_stopped") is True:
-                return _ok(rid, {"voice_stopped": True})  # the owner ended its voice chat; nothing queued
+                return _ok(rid, {"voice_stopped": True})  # the owner consumed the typed stop; nothing queued
+            if receipt.get("status") in ("steered", "redirected"):
+                # The words joined the owner's RUNNING turn (the session's busy policy), not its FIFO.
+                return _ok(rid, {"status": receipt["status"], "forwarded": True})
             return _ok(rid, {"status": "queued", "admission_id": receipt.get("admission_id"),
                              "forwarded": True})
     return _err(rid, 4090, "The gateway is running a turn in this chat and " + why
