@@ -534,7 +534,7 @@ BEGIN
       AND display_identity = new.display_identity
       AND (new.active = 1 OR new.compacted = 1);
     UPDATE messages SET display_order = (
-        SELECT MIN(peer.id) FROM messages AS peer
+        SELECT MIN(COALESCE(peer.display_order, peer.id)) FROM messages AS peer
         WHERE peer.session_id = old.session_id AND (peer.active = 1 OR peer.compacted = 1)
           AND peer.display_identity = old.display_identity
     ) WHERE session_id = old.session_id AND (active = 1 OR compacted = 1)
@@ -564,7 +564,7 @@ CREATE TRIGGER IF NOT EXISTS messages_display_identity_delete
 AFTER DELETE ON messages WHEN old.active = 1 OR old.compacted = 1
 BEGIN
     UPDATE messages SET display_order = (
-        SELECT MIN(peer.id) FROM messages AS peer
+        SELECT MIN(COALESCE(peer.display_order, peer.id)) FROM messages AS peer
         WHERE peer.session_id = old.session_id AND (peer.active = 1 OR peer.compacted = 1)
           AND peer.display_identity = old.display_identity
     ) WHERE session_id = old.session_id AND (active = 1 OR compacted = 1)
