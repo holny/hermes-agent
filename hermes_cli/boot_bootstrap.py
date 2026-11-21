@@ -265,14 +265,28 @@ def _retry_owed_migration(record: Path, identity: str, known: dict):
     to one attempt per revision."""
     from hermes_cli import post_update
 
-    if not _owed_steps(known):
+    from hermes_cli.default_plugins import _state
+    from pm.environments import dependency_home_root
+
+    def steps_due(state: dict) -> list[str]:
+        names = _owed_steps(state)
+        if "install_default_plugins" in dict(post_update.BOOT_HOME_STEPS) and "install_default_plugins" not in names:
+            try:
+                settled = _state(Path(dependency_home_root()), "settled").read_text(encoding="utf-8-sig").strip()
+            except OSError:
+                settled = None
+            if settled != identity:
+                names.append("install_default_plugins")
+        return names
+
+    if not steps_due(known):
         return "skipped"
     lock = _RecordLock(record)
     if not lock.acquire():
         return "lost-race"
     try:
         known = read_last_known(record)
-        names = _owed_steps(known)
+        names = steps_due(known)
         if not names or known.get("identity") != identity:
             return "skipped"
         owed = owed_config_migration(known)

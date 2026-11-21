@@ -6,6 +6,7 @@ that places the plugin directory (the live install is exercised end to end outsi
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,20 @@ from hermes_cli.plugin_catalog import entry_from_mapping
 def _entry(name: str, tier: str = "official"):
     return entry_from_mapping({"name": name, "repo": "https://github.com/NousResearch/hermes-official-plugins",
                                "sha": "a" * 40, "description": "d", "maintainer": "NousResearch", "tier": tier,
-                               "default": True}, name)
+                                "default": True}, name)
+
+
+_WINDOWS_CRASH_CHILD_SCRIPT = '''import os, sys, threading
+from pathlib import Path
+root = Path(sys.argv[1])
+Path(root, "children", str(os.getpid())).touch()
+while not Path(root, "stop").exists():
+    threading.Event().wait(.02)
+'''
+
+
+def test_windows_crash_child_script_is_valid_python():
+    ast.parse(_WINDOWS_CRASH_CHILD_SCRIPT)
 
 
 @pytest.fixture
@@ -120,6 +134,11 @@ def test_an_owed_boot_step_stays_owed_until_it_succeeds(tmp_path, monkeypatch):
         outcome = next(script)
         if isinstance(outcome, Exception):
             raise outcome
+        if not outcome.get("owed"):
+            from pm.environments import dependency_home_root
+            settled = default_plugins._state(Path(dependency_home_root()), "settled")
+            settled.parent.mkdir(parents=True, exist_ok=True)
+            settled.write_text("a" * 40)
         return outcome
     monkeypatch.setattr(post_update, "BOOT_HOME_STEPS", (("install_default_plugins", step),))
     root = tmp_path / "install"
@@ -206,6 +225,281 @@ def test_default_entries_keep_the_tier_and_platform_rules(monkeypatch):
     assert [entry.name for entry in default_plugins.default_entries()] == ["here"]
 
 
+def test_running_installer_receives_request_without_another_child(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    import pm.environments
+    monkeypatch.setattr(pm.environments, "dependency_home_root", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "from hermes_cli.default_plugins import _machine_lock; "
+         "import sys, pm.environments; pm.environments.dependency_home_root = lambda: sys.argv[1]; "
+         "lock = _machine_lock(2); lock.__enter__(); "
+         "print('locked', flush=True); sys.stdin.readline(); lock.__exit__(None, None, None)", str(tmp_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        children = []
+        monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: children.append(args))
+        assert not default_plugins.spawn_install()
+        assert children == []
+        assert default_plugins._state(tmp_path, "rerun").exists()
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)
+
+
+def test_concurrent_parents_start_only_one_child(tmp_path):
+    import subprocess
+    import sys
+
+    script = """
+import sys
+from pathlib import Path
+import hermes_cli._launchers as launchers
+import pm.environments
+from hermes_cli.default_plugins import spawn_install
+root = Path(sys.argv[1])
+pm.environments.dependency_home_root = lambda: root
+launchers.runtime_command = lambda *args, **kwargs: [sys.executable, '-c',
+    'import sys,threading; from pathlib import Path; Path(sys.argv[1]).open("a").write("child\\\\n"); threading.Event().wait(4)',
+    str(root / 'children')]
+sys.stdin.readline()
+print(spawn_install(), flush=True)
+"""
+    parents = [subprocess.Popen([sys.executable, "-c", script, str(tmp_path)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True) for _ in range(2)]
+    try:
+        for parent in parents:
+            parent.stdin.write("go\n")
+            parent.stdin.flush()
+        results = [parent.communicate(timeout=15) for parent in parents]
+        assert all(parent.returncode == 0 for parent in parents), results
+        assert sorted(result[0].strip() for result in results) == ["False", "True"]
+        from tests.waiting import wait_until
+        assert wait_until(lambda: (tmp_path / "children").exists(), timeout=5)
+        assert (tmp_path / "children").read_text().splitlines() == ["child"]
+    finally:
+        for parent in parents:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=10)
+
+
+def test_new_profile_during_cross_process_install_is_rescanned(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    import pm.environments
+    monkeypatch.setattr(pm.environments, "dependency_home_root", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    script = """
+import sys
+from pathlib import Path
+import pm.environments, pm.plugins_state, hermes_cli.plugin_catalog
+from hermes_cli import default_plugins as d
+root = Path(sys.argv[1])
+pm.environments.dependency_home_root = lambda: root
+pm.plugins_state.dependency_homes = lambda: [root / 'default'] + ([root / 'new'] if (root / 'new').exists() else [])
+hermes_cli.plugin_catalog.fetch_live_catalog = lambda: {'entries': [1]}
+d.default_entries = lambda: [object()]
+d.fetch_policy = lambda home: 'allowed'
+d._identity = lambda: 'revision'
+first = True
+def install(home, **kwargs):
+    global first
+    print(home.name, flush=True)
+    if first:
+        first = False
+        sys.stdin.readline()
+    return {'installed': [], 'owed': []}
+d.install_defaults = install
+print(d.install_and_record(wait=5)['owed'], flush=True)
+"""
+    holder = subprocess.Popen([sys.executable, "-c", script, str(tmp_path)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "default"
+        (tmp_path / "new").mkdir()
+        children = []
+        monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: children.append(args))
+        assert not default_plugins.spawn_install(tmp_path / "new")
+        assert children == []
+        holder.stdin.write("continue\n")
+        holder.stdin.flush()
+        output = holder.stdout.read().splitlines()
+        assert holder.wait(timeout=10) == 0
+        assert output == ["default", "new", "[]"]
+        assert default_plugins._state(tmp_path, "settled").read_text() == "revision"
+    finally:
+        holder.stdin.close()
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=10)
+
+
+@pytest.mark.platforms("posix")
+def test_parent_dies_after_spawn_without_starting_a_second_child(tmp_path):
+    import subprocess
+    import sys
+
+    (tmp_path / "children").mkdir()
+    script = """
+import os, sys
+from pathlib import Path
+import pm.environments, hermes_cli._launchers as launchers
+from hermes_cli import default_plugins as d
+root = Path(sys.argv[1])
+pm.environments.dependency_home_root = lambda: root
+launchers.runtime_command = lambda *a, **k: [sys.executable, '-c',
+    'import os,sys,threading; from pathlib import Path; Path(sys.argv[1], str(os.getpid())).touch(); threading.Event().wait(8)',
+    str(root / 'children')]
+if sys.argv[2] == 'crash':
+    original = d.subprocess.Popen
+    def crash(*args, **kwargs):
+        original(*args, **kwargs)
+        os._exit(73)
+    d.subprocess.Popen = crash
+print(d.spawn_install(), flush=True)
+"""
+    first = subprocess.run([sys.executable, "-c", script, str(tmp_path), "crash"],
+                           capture_output=True, text=True, timeout=15, check=False)
+    assert first.returncode == 73, first.stderr
+    from tests.waiting import wait_until
+    assert wait_until(lambda: list((tmp_path / "children").iterdir()), timeout=5)
+    second = subprocess.run([sys.executable, "-c", script, str(tmp_path), "retry"],
+                            capture_output=True, text=True, timeout=15, check=False)
+    assert second.returncode == 0, second.stderr
+    assert second.stdout.strip() == "False"
+    assert len(list((tmp_path / "children").iterdir())) == 1
+
+
+@pytest.mark.platforms("windows")
+def test_windows_parent_crash_preserves_child_claim_and_recovers(tmp_path):
+    import subprocess
+    import sys
+
+    from tests.waiting import wait_until
+
+    (tmp_path / "children").mkdir()
+    script = """
+import os, sys
+from pathlib import Path
+import pm.environments, hermes_cli._launchers as launchers
+from hermes_cli import default_plugins as d
+root = Path(sys.argv[1])
+pm.environments.dependency_home_root = lambda: root
+child_script = CHILD_SCRIPT_PLACEHOLDER
+launchers.runtime_command = lambda *a, **k: [sys.executable, '-c', child_script, str(root)]
+if sys.argv[2] == 'crash':
+    original = d.subprocess.Popen
+    def crash(*args, **kwargs):
+        original(*args, **kwargs)
+        os._exit(73)
+    d.subprocess.Popen = crash
+print(d.spawn_install(), flush=True)
+"""
+    script = script.replace("CHILD_SCRIPT_PLACEHOLDER", repr(_WINDOWS_CRASH_CHILD_SCRIPT))
+    ast.parse(script)
+
+    def run(mode):
+        return subprocess.run([sys.executable, "-c", script, str(tmp_path), mode],
+                              capture_output=True, text=True, timeout=15, check=False)
+
+    try:
+        first = run("crash")
+        assert first.returncode == 73, first.stderr
+        assert wait_until(lambda: len(list((tmp_path / "children").iterdir())) == 1, timeout=5)
+        second = run("retry")
+        assert second.returncode == 0, second.stderr
+        assert second.stdout.strip() == "False"
+        assert len(list((tmp_path / "children").iterdir())) == 1
+        (tmp_path / "stop").touch()
+        assert wait_until(lambda: not default_plugins._live_child(tmp_path), timeout=10)
+        (tmp_path / "stop").unlink()
+        third = run("retry")
+        assert third.returncode == 0, third.stderr
+        assert third.stdout.strip() == "True"
+        assert wait_until(lambda: len(list((tmp_path / "children").iterdir())) == 2, timeout=5)
+    finally:
+        (tmp_path / "stop").touch()
+
+
+def test_new_profile_backoff_keeps_existing_boot_record_owed(tmp_path, monkeypatch):
+    from hermes_cli import boot_bootstrap, post_update
+    import pm.environments
+    from hermes_cli.memory_provider_migration import _note_failure
+
+    monkeypatch.setattr(pm.environments, "dependency_home_root", lambda: tmp_path)
+    monkeypatch.setattr(boot_bootstrap, "current_install_identity", lambda root: "revision")
+    monkeypatch.setattr(default_plugins, "_identity", lambda: "revision")
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    home = tmp_path / "new"
+    home.mkdir()
+    monkeypatch.setattr("pm.plugins_state.dependency_homes", lambda: [home])
+    monkeypatch.setattr(post_update, "BOOT_HOME_STEPS", (("install_default_plugins", default_plugins.step_install_default_plugins),))
+    record = tmp_path / "boot.json"
+    monkeypatch.setattr(boot_bootstrap, "record_path", lambda root: record)
+    default_plugins._state(tmp_path, "settled").parent.mkdir(parents=True)
+    default_plugins._state(tmp_path, "settled").write_text("revision")
+    assert boot_bootstrap.run_boot_bootstrap(tmp_path)["home"]["install_default_plugins"] == {"ok": True}
+    _note_failure(tmp_path, default_plugins._BACKOFF)
+    assert not default_plugins.spawn_install(home)
+    assert boot_bootstrap.run_boot_bootstrap(tmp_path)["home"]["install_default_plugins"]["owed"]
+
+
+def test_uninspectable_child_claim_does_not_spawn_again(tmp_path, monkeypatch):
+    import psutil
+    import pm.environments
+
+    monkeypatch.setattr(pm.environments, "dependency_home_root", lambda: tmp_path)
+    record = default_plugins._state(tmp_path, "child")
+    record.parent.mkdir(parents=True)
+    record.write_text("123 456\n")
+    monkeypatch.setattr(psutil, "Process", lambda pid: (_ for _ in ()).throw(psutil.AccessDenied(pid)))
+    assert default_plugins._live_child(tmp_path)
+
+
+def test_zombie_child_claim_does_not_block_retry(tmp_path, monkeypatch):
+    import psutil
+
+    record = default_plugins._state(tmp_path, "child")
+    record.parent.mkdir(parents=True)
+    record.write_text("123 456\n")
+
+    class Zombie:
+        def create_time(self):
+            return 456.0
+
+        def status(self):
+            return psutil.STATUS_ZOMBIE
+
+    monkeypatch.setattr(psutil, "Process", lambda pid: Zombie())
+    assert not default_plugins._live_child(tmp_path)
+
+
+@pytest.mark.platforms("linux")
+def test_unreaped_linux_child_is_not_a_live_claim(tmp_path):
+    import subprocess
+    import sys
+
+    from tests.waiting import wait_until
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        import psutil
+        assert wait_until(lambda: psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE, timeout=5)
+        record = default_plugins._state(tmp_path, "child")
+        record.parent.mkdir(parents=True)
+        record.write_text(f"{child.pid} {psutil.Process(child.pid).create_time()}\n")
+        assert not default_plugins._live_child(tmp_path)
+    finally:
+        child.wait(timeout=5)
+
+
 def test_an_unreadable_config_keeps_the_home_owed_and_a_repinned_leftover_is_replaced(tmp_path, monkeypatch):
     """The leftover is replaced by removing that dir, never by forcing over the destination (Greptile)."""
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
@@ -274,4 +568,3 @@ def test_a_retry_that_removed_our_leftover_and_then_failed_stays_owed(tmp_path, 
     assert not (home / "plugins" / "accent-picker").exists()  # the retry removed our leftover
     assert default_plugins.install_defaults(home, entries=entries)["owed"] == ["accent-picker"]
     assert attempts == ["accent-picker"] * 3, "a tree we removed was read as the user's removal"
-

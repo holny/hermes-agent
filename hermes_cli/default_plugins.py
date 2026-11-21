@@ -191,10 +191,9 @@ def install_defaults(home: Path, *, say: Callable[[str], None] = logger.info,
     return result
 
 
-def install_defaults_all_homes(*, say: Callable[[str], None] = print, wait: float = 900.0) -> dict:
+def install_defaults_all_homes(*, say: Callable[[str], None] = print) -> dict:
     """Every profile home sharing this install (the default home plus each live profile). The catalog is
-    read once; one home's failure never stops the next. Waits up to *wait* seconds for another installer
-    to finish (``TimeoutError`` past that)."""
+    read once; one home's failure never stops the next. The coordinator holds the machine lock."""
     from hermes_cli.plugin_catalog import fetch_live_catalog
     from pm.plugins_state import dependency_homes
     summary: dict = {"installed": [], "owed": []}
@@ -208,15 +207,14 @@ def install_defaults_all_homes(*, say: Callable[[str], None] = print, wait: floa
         summary["owed"].append("live catalog")
     if not entries:
         return summary
-    with _machine_lock(wait):  # never two installers in one home (an update tail beside a detached child)
-        for home in homes:
-            try:
-                outcome = install_defaults(home, say=say, entries=entries)
-            except Exception:  # health: allow BLE001 -- one home (unreadable config.yaml) never stops the rest; retried next run
-                logger.warning("default plugins skipped for %s", home, exc_info=True)
-                outcome = {"installed": [], "owed": [str(home)]}
-            summary["installed"] += outcome["installed"]
-            summary["owed"] += outcome["owed"]
+    for home in homes:
+        try:
+            outcome = install_defaults(home, say=say, entries=entries)
+        except Exception:  # health: allow BLE001 -- one home (unreadable config.yaml) never stops the rest; retried next run
+            logger.warning("default plugins skipped for %s", home, exc_info=True)
+            outcome = {"installed": [], "owed": [str(home)]}
+        summary["installed"] += outcome["installed"]
+        summary["owed"] += outcome["owed"]
     return summary
 
 
@@ -226,7 +224,39 @@ def _machine_lock(wait: float):
     from hermes_cli.auth import _file_lock
     from pm.environments import dependency_home_root
     return _file_lock(_state(Path(dependency_home_root()), "lock"), threading.local(), wait,
-                      "another default plugin install is running")
+                       "another default plugin install is running")
+
+
+def _spawn_lock(root: Path):
+    from hermes_cli.auth import _file_lock
+    return _file_lock(_state(root, "spawn-lock"), threading.local(), 5.0,
+                      "another default plugin spawn is starting")
+
+
+def _live_child(root: Path) -> bool:
+    import psutil
+    if os.name == "posix":
+        import fcntl
+        claim = _state(root, "child-lock")
+        with claim.open("a+b") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    else:
+        from hermes_cli.update_lock import _windows_close, _windows_open_exclusive
+        claim = _windows_open_exclusive(_state(root, "child-lock"))
+        if claim is None:
+            return True
+        _windows_close(claim)
+    try:
+        pid, birth = _state(root, "child").read_text(encoding="ascii").split()
+        process = psutil.Process(int(pid))
+        return process.create_time() == float(birth) and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.AccessDenied:
+        return True  # a process we cannot inspect is not proof that the claim is stale
+    except (OSError, ValueError, psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
 
 
 # ── detached child: first start, profile create ──────────────────────────────
@@ -254,23 +284,57 @@ def spawn_install(home: Optional[Path] = None) -> bool:
     root = Path(dependency_home_root())
     if home is not None and fetch_policy(home) == "denied":
         return False
-    _state(root, "settled").unlink(missing_ok=True)  # unsettled until a pass installs it, so every boot re-checks
-    if _failed_recently(root, _BACKOFF):
-        return False
-    rerun = _state(root, "rerun")
-    rerun.parent.mkdir(parents=True, exist_ok=True)
-    rerun.touch()
-    argv = runtime_command(install_root(), module="hermes_cli.default_plugins")
-    kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-    try:
-        # detached-spawn: ok — git and dependency installs must neither delay a boot or a create nor die with it; one installer at a time (OS lock)
-        subprocess.Popen(argv, **kwargs, **windows_detach_popen_kwargs())
-    except OSError:
+    with _spawn_lock(root):
+        _state(root, "settled").unlink(missing_ok=True)
+        if _failed_recently(root, _BACKOFF):
+            return False
+        rerun = _state(root, "rerun")
+        rerun.parent.mkdir(parents=True, exist_ok=True)
+        with rerun.open("ab") as request:
+            request.write(b"1")
+        from hermes_cli.auth import _is_lock_contention, _kernel_lock, msvcrt
+        machine = _state(root, "lock")
+        if msvcrt and not machine.exists():
+            machine.write_text(" ", encoding="ascii")
+        with machine.open("r+" if msvcrt else "a+", encoding="ascii") as handle:
+            try:
+                _kernel_lock(handle, True)
+            except OSError as exc:
+                if _is_lock_contention(exc):
+                    return False
+                raise
+            _kernel_lock(handle, False)
+        if _live_child(root):
+            return False
+        argv = runtime_command(install_root(), module="hermes_cli.default_plugins")
+        kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
         if not IS_WINDOWS:
-            raise
-        # A job object without BREAKAWAY_OK refuses CREATE_BREAKAWAY_FROM_JOB; retry without it.
-        subprocess.Popen(argv, **kwargs, creationflags=windows_detach_flags_without_breakaway())
-    return True
+            import fcntl
+            # The kernel claim survives a parent crash between Popen and its return.
+            with _state(root, "child-lock").open("a+b") as claim:
+                fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # detached-spawn: ok — default installs must survive boot's parent exiting.
+                subprocess.Popen(argv, **kwargs, pass_fds=(claim.fileno(),), **windows_detach_popen_kwargs())
+            return True
+        from hermes_cli.update_lock import _windows_close, _windows_open_exclusive
+        claim = _windows_open_exclusive(_state(root, "child-lock"))
+        if claim is None:
+            return False
+        try:
+            # Share-deny belongs to the kernel handle, not the process's byte-range locks.
+            # STARTUPINFO hands the same handle to the child before Popen can return or we can die.
+            os.set_handle_inheritable(claim, True)
+            info = subprocess.STARTUPINFO()
+            info.lpAttributeList = {"handle_list": [claim]}
+            try:
+                # detached-spawn: ok — default installs must survive boot's parent exiting.
+                subprocess.Popen(argv, **kwargs, startupinfo=info, **windows_detach_popen_kwargs())
+            except OSError:
+                subprocess.Popen(argv, **kwargs, startupinfo=info,
+                                 creationflags=windows_detach_flags_without_breakaway())
+        finally:
+            _windows_close(claim)
+        return True
 
 
 def _run_child() -> int:
@@ -295,25 +359,41 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
     """The one coordinator (update tail and detached child): :func:`install_defaults_all_homes` again until
     no rescan was requested meanwhile (a profile created during the pass), then the outcome the boot step
     reads: a failure begins the backoff, a clean pass marks this revision settled."""
-    import time
     from hermes_cli.memory_provider_migration import _note_failure, _note_success
     from pm.environments import dependency_home_root
     root = Path(dependency_home_root())
     rerun = _state(root, "rerun")
-    while True:
-        started = time.time()
-        outcome = install_defaults_all_homes(say=say, wait=wait)
-        if not (rerun.exists() and rerun.stat().st_mtime >= started):
-            break
-    if outcome["owed"]:
-        _note_failure(root, _BACKOFF)
-        # A later pass (a profile created after this revision settled) can fail too: owed again.
-        _state(root, "settled").unlink(missing_ok=True)
-        return outcome
-    _note_success(root, _BACKOFF)
-    _state(root, "settled").parent.mkdir(parents=True, exist_ok=True)
-    _state(root, "settled").write_text(_identity(), encoding="utf-8")
-    return outcome
+    lock = _machine_lock(wait)
+    lock.__enter__()
+    try:
+        while True:
+            with _spawn_lock(root):
+                started = rerun.stat().st_size if rerun.exists() else 0
+            outcome = install_defaults_all_homes(say=say)
+            with _spawn_lock(root):
+                if rerun.exists() and rerun.stat().st_size != started:
+                    continue
+                if outcome["owed"]:
+                    _note_failure(root, _BACKOFF)
+                    _state(root, "settled").unlink(missing_ok=True)
+                else:
+                    _note_success(root, _BACKOFF)
+                    _state(root, "settled").parent.mkdir(parents=True, exist_ok=True)
+                    _state(root, "settled").write_text(_identity(), encoding="utf-8")
+                rerun.unlink(missing_ok=True)
+                child_record = _state(root, "child")
+                try:
+                    owned = int(child_record.read_text(encoding="ascii").split()[0]) == os.getpid()
+                except (OSError, ValueError, IndexError):
+                    owned = False
+                if owned:
+                    child_record.unlink(missing_ok=True)
+                lock.__exit__(None, None, None)
+                lock = None
+                return outcome
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
 
 
 def step_install_default_plugins() -> dict:
