@@ -85,6 +85,10 @@ jobs:
           set -uo pipefail
           bash scripts/run_tests.sh tests/tools/test_process_registry_windows_live.py
 
+      - name: Run default plugin installer Windows tests
+        shell: bash
+        run: bash scripts/run_tests.sh tests/hermes_cli/test_default_plugins.py
+
       - name: Turn Windows long paths off for later steps (#130242)
         # The runner image turns LongPathsEnabled on; 0 is the Windows default
         # most users have. A process reads the value when it starts, so only
