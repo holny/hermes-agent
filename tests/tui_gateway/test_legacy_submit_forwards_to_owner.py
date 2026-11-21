@@ -60,7 +60,7 @@ def _legacy(monkeypatch, db):
 
 def _owner(monkeypatch, db, key, epoch):
     from gateway.session_authority import LiveSession, SessionAuthority
-    authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id="owned", instance_id="gateway",
+    authority = SessionAuthority(SimpleNamespace(_draining=False, _effective_busy_input_mode=lambda _s: "queue"), profile_id="owned", instance_id="gateway",
                                  epoch=epoch, persistence=storage_handle(db.scope.profile_dir))
     authority.sessions[key] = LiveSession(SimpleNamespace(platform=None, user_id="desktop"), "route")
     monkeypatch.setattr(authority, "_schedule", lambda ref: None)  # the test drives the FIFO
@@ -269,7 +269,7 @@ def test_a_receipt_lost_after_the_owner_queued_it_is_unconfirmed_not_resendable(
                                        "params": {"session_id": sid, "text": "my question"}})
         mine = [row for row in db.admissions.list(session_id=key)
                 if row.payload.get("text") == "my question"]
-        assert seen == ["session.resume", "prompt.submit"] and len(mine) == 1  # the owner holds it
+        assert seen == ["session.resume", "config.get", "prompt.submit"] and len(mine) == 1
         db.admissions.recover(epoch=db.runtime.begin_epoch(instance_id="gateway-2"))
         after = {row.admission_id: row.status for row in db.admissions.list(session_id=key)}
         assert after[mine[0].admission_id] == "queued"  # it survives the restart and will run

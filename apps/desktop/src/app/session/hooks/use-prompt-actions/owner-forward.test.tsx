@@ -135,41 +135,46 @@ describe('usePromptActions gateway-owner queue (#140385)', () => {
     expect(errorCardOffers(bubble?.errorSurface, 'retry')).toBe(false)
   })
 
-  it('shows a prompt the legacy backend forwarded to the gateway owner as queued, not as a failed turn (#140385)', async () => {
-    let latest: Record<string, unknown> | undefined
+  it.each(['queued', 'steered', 'redirected'] as const)(
+    'clears the optimistic send when the legacy backend forwards it as %s',
+    async status => {
+      let latest: Record<string, unknown> | undefined
 
-    // The legacy backend refuses `submission_id` (4000, pre-admission), then answers the identityless
-    // retry with the owner's queued receipt: the prompt waits in the gateway's FIFO.
-    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      if (method === 'prompt.submit' && params?.submission_id) {
-        throw new JsonRpcGatewayError("unknown field 'submission_id'", { code: 4000 })
-      }
+      // The legacy backend refuses `submission_id` (4000, pre-admission), then answers the identityless
+      // retry with the owner's receipt: a queued send waits in its FIFO, while a correction
+      // joins the live turn instead of starting a second one on the legacy backend.
+      const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'prompt.submit' && params?.submission_id) {
+          throw new JsonRpcGatewayError("unknown field 'submission_id'", { code: 4000 })
+        }
 
-      if (method === 'prompt.submit') {
-        return { status: 'queued', admission_id: 'owner-admission', forwarded: true } as never
-      }
+        if (method === 'prompt.submit') {
+          return { status, ...(status === 'queued' && { admission_id: 'owner-admission' }), forwarded: true } as never
+        }
 
-      return {} as never
-    })
+        return {} as never
+      })
 
-    let handle: HarnessHandle | null = null
-    await actRender(
-      <Harness
-        onReady={h => (handle = h)}
-        onSeedState={next => {
-          latest = next
-        }}
-        refreshSessions={async () => undefined}
-        requestGateway={requestGateway}
-      />
-    )
+      let handle: HarnessHandle | null = null
+      await actRender(
+        <Harness
+          onReady={h => (handle = h)}
+          onSeedState={next => {
+            latest = next
+          }}
+          refreshSessions={async () => undefined}
+          requestGateway={requestGateway}
+        />
+      )
 
-    expect(await handle!.submitText('my own question')).toBe(true)
-    const messages = (latest?.messages ?? []) as { error?: string; role?: string }[]
-    // No failed-turn card and no optimistic bubble: the queued-row card stands for the send.
-    expect(messages.some(message => message.error)).toBe(false)
-    expect(messages.some(message => message.role === 'user')).toBe(false)
-    expect(latest?.busy).toBe(false)
-    expect(latest?.awaitingResponse).toBe(false)
-  })
+      expect(await handle!.submitText('my own question')).toBe(true)
+      const messages = (latest?.messages ?? []) as { error?: string; role?: string }[]
+      // No failed-turn card or duplicate optimistic bubble: the owner owns the queued card
+      // or the live correction from this point on.
+      expect(messages.some(message => message.error)).toBe(false)
+      expect(messages.some(message => message.role === 'user')).toBe(false)
+      expect(latest?.busy).toBe(false)
+      expect(latest?.awaitingResponse).toBe(false)
+    }
+  )
 })

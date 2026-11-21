@@ -1282,7 +1282,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               }
             }
 
-            // RT-37: forwarded to the gateway owner's FIFO; its queued-row card stands for the send.
+            // The owner holds the queued send or applies the correction to its live turn;
+            // neither leaves a local optimistic bubble or a second local spinner.
             if (isForwardedReceipt(legacyAccepted, result)) {
               abortForSessionSwitch(sessionId)
             }

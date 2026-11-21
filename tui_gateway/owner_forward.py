@@ -62,8 +62,7 @@ class OwnerNotRunning(OwnerUnavailable):
 
 
 class OwnerUnconfirmed(OwnerUnavailable):
-    """The owner's admission receipt did not arrive in time. The relay keeps going, so the prompt
-    may still be (or already be) queued there: never "nothing was sent", never a retry."""
+    """The owner may already have applied or queued the input; never promise a safe retry."""
 
 
 def discover_owner(home: Path):
@@ -120,9 +119,10 @@ def _payload_for(event_type: str, payload: Any) -> dict | None:
 
 
 class _Relay:
-    def __init__(self, sid: str, session: dict, key: str, home: Path, endpoint, text: str, emit):
+    def __init__(self, sid: str, session: dict, key: str, home: Path, endpoint, text: str, emit,
+                 *, queued: bool = False):
         self.sid, self.session, self.key, self.home, self.text, self.emit = sid, session, key, home, text, emit
-        self.endpoint, self.listed = endpoint, None
+        self.endpoint, self.listed, self.queued = endpoint, None, queued
         self.admitted: Future = Future()
         self.request_id = "desktop-forward-" + uuid.uuid4().hex
 
@@ -139,11 +139,15 @@ class _Relay:
         async with connect_owner(self.home, self.endpoint) as client:
             attached = await client.rpc("session.resume", session_id=self.key)
             target = str(attached.get("session_id") or self.key)
-            receipt = await self._submit(client, target)
+            receipt = await self._submit(client, target, attached)
             if receipt.get("voice_stopped") is True:
                 # TUI-26: the owner took a typed stop phrase as the end of its LOCAL voice chat and
                 # admitted nothing: there is no turn to relay.
                 self.admitted.set_result(receipt)
+                return
+            if receipt.get("status") in ("steered", "redirected"):
+                self.admitted.set_result(receipt)
+                await self._relay(client, None, attached["execution_generation"])
                 return
             admission_id = receipt.get("admission_id")
             if not isinstance(admission_id, str) or receipt.get("status") not in ("queued", "started", "terminal"):
@@ -153,7 +157,44 @@ class _Relay:
                         self.key, admission_id)
             await self._relay(client, admission_id)
 
-    async def _submit(self, client, target: str) -> dict:
+    async def _submit(self, client, target: str, attached: dict) -> dict:
+        if not self.queued and attached.get("running") is True and type(attached.get("execution_generation")) is int:
+            try:
+                mode = await client.rpc("config.get", session_id=target, key="busy")
+            except Exception:
+                mode = None
+            mode = mode.get("value") if isinstance(mode, dict) else None
+            if mode in ("steer", "interrupt"):
+                correction = await self._correct(client, target, attached["execution_generation"], mode)
+                if correction is not None:
+                    return correction
+        return await self._admit(client, target)
+
+    async def _correct(self, client, target: str, generation: int, mode: str) -> dict | None:
+        from hermes_cli.gateway_client import GatewayRPCError
+        try:
+            answer = await client.rpc("session.steer" if mode == "steer" else "session.redirect",
+                                      session_id=target, text=self.text, execution_generation=generation)
+        except Exception as exc:
+            reason = exc.data.get("reason") if isinstance(exc, GatewayRPCError) else None
+            if reason == "stale_generation":
+                return None
+            if reason in ("unsupported_control", "execution_not_ready"):
+                return None  # the owner refused before calling the agent; FIFO is safe
+            if reason in ("invalid_params", "profile_mismatch", "permission_denied"):
+                raise OwnerUnavailable(f"the gateway refused the correction: {reason}") from exc
+            raise OwnerUnconfirmed("the gateway did not confirm the correction") from exc
+        if isinstance(answer, dict):
+            if answer.get("voice_stopped") is True:
+                return {"voice_stopped": True}
+            status = answer.get("status")
+            if status == ("queued" if mode == "steer" else "redirected"):
+                return {"status": "steered" if mode == "steer" else "redirected"}
+            if status == "rejected" and answer.get("delivered") is False:
+                return None
+        raise OwnerUnconfirmed("the gateway did not confirm the correction")
+
+    async def _admit(self, client, target: str) -> dict:
         """``prompt.submit`` on the owner. Once the request is handed to the socket, only a received
         refusal the owner raises before its write (``_REFUSED_BEFORE_COMMIT``) proves nothing was
         queued: a lost connection, a missing answer or any other error may follow the owner's durable
@@ -161,20 +202,27 @@ class _Relay:
         unconfirmed, never "nothing was sent" (a resend would run a second copy)."""
         from hermes_cli.gateway_client import GatewayRPCError
         try:
-            return await client.rpc("prompt.submit", session_id=target, text=self.text,
-                                    submission_id=self.request_id)
+            receipt = await client.rpc("prompt.submit", session_id=target, text=self.text,
+                                       submission_id=self.request_id)
         except Exception as exc:
             # The owner names its refusal in ``data.reason``; ``message`` may be a display string.
             reason = exc.data.get("reason", str(exc)) if isinstance(exc, GatewayRPCError) else None
             if isinstance(reason, str) and reason in _REFUSED_BEFORE_COMMIT:
                 raise
             raise OwnerUnconfirmed("the gateway did not confirm it") from exc
+        if not isinstance(receipt, dict) or not (
+            receipt.get("voice_stopped") is True
+            or (isinstance(receipt.get("admission_id"), str)
+                and receipt.get("status") in ("queued", "started", "terminal"))
+        ):
+            raise OwnerUnconfirmed("the gateway did not confirm it")
+        return receipt
 
-    def _pending(self, params: dict, admission_id: str) -> None:
+    def _pending(self, params: dict, admission_id: str | None) -> None:
         """The owner's pending list as this wire's ``pending_submissions``, this admission only: the
         Desktop's queued-row card while it waits, retired once the owner starts it."""
         rows = (params.get("payload") or {}).get("pending")
-        if not isinstance(rows, list):
+        if not isinstance(rows, list) or admission_id is None:
             return
         listed = [{"admission_id": admission_id, "status": "queued", "user": self.text, "input_id": self.request_id}
                   for row in rows if isinstance(row, dict) and row.get("admission_id") == admission_id
@@ -183,7 +231,7 @@ class _Relay:
             self.listed = listed
             self.emit("session.info", self.sid, {"stored_session_id": self.key, "pending_submissions": listed})
 
-    async def _relay(self, client, admission_id: str) -> None:
+    async def _relay(self, client, admission_id: str | None, generation: int | None = None) -> None:
         settled = False
         try:
             async with asyncio.timeout(RELAY_TIMEOUT_S):
@@ -201,7 +249,9 @@ class _Relay:
                     if params.get("type") == "session.info":
                         self._pending(params, admission_id)
                         continue
-                    if params.get("admission_id") != admission_id:
+                    if admission_id is not None and params.get("admission_id") != admission_id:
+                        continue
+                    if generation is not None and params.get("execution_generation") != generation:
                         continue
                     event_type = params.get("type")
                     if event_type not in _RELAYED:
@@ -232,7 +282,8 @@ def forward_rpc(home: Path, endpoint, method: str, params: dict) -> Any:
     return asyncio.run(call())
 
 
-def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path | None = None) -> dict:
+def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path | None = None,
+                   queued: bool = False) -> dict:
     """Admit ``text`` into the owner's FIFO for this session; the owner's receipt.
 
     Raises ``OwnerNotRunning`` when no gateway serves the home, ``OwnerUnavailable`` (or the
@@ -243,7 +294,8 @@ def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path 
     if not key:
         raise OwnerUnavailable("the chat has no stored session yet")
     home = Path(home or session.get("profile_home") or server._hermes_home).resolve()
-    relay = _Relay(sid, session, key, home, discover_owner(home), text, emit or server._emit)
+    relay = _Relay(sid, session, key, home, discover_owner(home), text, emit or server._emit,
+                   queued=queued)
     from agent.memory_provider import spawn_context_thread
     spawn_context_thread(relay.run, name=f"owner-forward-{key[:24]}").start()
     try:

@@ -366,14 +366,17 @@ export function ownershipErrorSurface(error: unknown): { errorSurface?: ErrorSur
     : {}
 }
 
-// RT-37: a legacy backend handed this prompt to the gateway that owns the chat, where it waits in
-// the owner's FIFO behind the gateway's turn. The queued-row card (the backend's
-// pending_submissions) stands for it until the owner starts it: no optimistic bubble or spinner.
+// A legacy backend handed the prompt to the gateway owner. A queued-row card stands for FIFO
+// admission; steered/redirected corrections join the owner's live turn. None run locally.
 export function isForwardedReceipt(
   legacyAccepted: boolean,
   result: { forwarded?: boolean | null; status?: string } | undefined
 ): boolean {
-  return legacyAccepted && result?.forwarded === true && result.status === 'queued'
+  return (
+    legacyAccepted &&
+    result?.forwarded === true &&
+    (result.status === 'queued' || result.status === 'steered' || result.status === 'redirected')
+  )
 }
 
 /** TUI-26: the owner ended the session's voice chat on a typed stop phrase and admitted nothing. The

@@ -760,12 +760,12 @@ def _submit_to_ledger_owner(rid, sid, session, text, params, refusal) -> dict:
             why = "an image cannot join its queue, so it was removed from this message"
     else:
         try:
-            receipt = owner_forward.forward_prompt(sid, session, text)
+            receipt = owner_forward.forward_prompt(sid, session, text, queued=params.get("queued") is True)
         except owner_forward.OwnerNotRunning:
             return not_owned  # no gateway runs the ledger's work: it will not end on its own
         except owner_forward.OwnerUnconfirmed:
             return _err(rid, 4090, "The gateway is running a turn in this chat and did not confirm your message"
-                        " in time. It may already be queued there: check the chat before sending it again.",
+                        ". It may already have taken effect or be queued there: check the chat before sending it again.",
                         {"reason": SESSION_OWNER_UNCONFIRMED})
         except Exception as exc:  # every owner failure is the same named refusal
             logger.info("forwarding prompt for %s to the owner failed: %s",
@@ -774,6 +774,8 @@ def _submit_to_ledger_owner(rid, sid, session, text, params, refusal) -> dict:
         else:
             if receipt.get("voice_stopped") is True:
                 return _ok(rid, {"voice_stopped": True})  # the owner ended its voice chat; nothing queued
+            if receipt.get("status") in ("steered", "redirected"):
+                return _ok(rid, {"status": receipt["status"], "forwarded": True})
             return _ok(rid, {"status": "queued", "admission_id": receipt.get("admission_id"),
                              "forwarded": True})
     return _err(rid, 4090, "The gateway is running a turn in this chat and " + why
