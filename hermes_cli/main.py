@@ -1497,6 +1497,12 @@ def cmd_chat(args):
         from hermes_cli.gateway_chat_startup import launch_gateway_chat
         sys.exit(launch_gateway_chat(args))
     _apply_safe_mode(args)
+    # Normalize the --query-file transport before any guard: every downstream check
+    # (non-interactive config guard, TUI seeding, oneshot) must see it exactly like -q.
+    # Reading it only after the TUI launch used to drop the flag silently (#158875):
+    # _launch_tui replaces the process, so the file was never read at all.
+    from hermes_cli.main_query_file import _read_query_file
+    _read_query_file(args)
     _apply_user_config_bypass(args)
     _guard_noninteractive_user_config(args)
     use_tui = _resolve_use_tui(args)
@@ -1552,9 +1558,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
             **passthrough,
         )
-
-    from hermes_cli.main_query_file import _read_query_file
-    _read_query_file(args)
 
     safe_mode = getattr(args, "safe_mode", False)
     kwargs = {
