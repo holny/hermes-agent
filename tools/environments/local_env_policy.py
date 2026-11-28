@@ -76,6 +76,18 @@ def _secret_source_bootstrap_env() -> frozenset[str]:
     return frozenset(name for source in list_sources() if (name := source.token_env({})))
 
 
+def _secret_source_bootstrap_env_now() -> frozenset[str]:
+    """The same names at call time. Built-in sources register while this module imports, so the
+    frozen snapshots (``_ALWAYS_STRIP_KEYS``, ``_HERMES_PROVIDER_ENV_BLOCKLIST``) carry them; a
+    plugin source registers during plugin discovery, after those snapshots were taken, and its
+    token kept reaching spawned children (#161034). Fail-soft to empty: the frozen sets keep the
+    built-ins stripped, and a broken plugin source must not disable every spawn's scrub."""
+    try:
+        return _secret_source_bootstrap_env()
+    except Exception:
+        return frozenset()
+
+
 def _left_core_env(*, secrets_only: bool) -> frozenset:
     """Env of features that left core for a catalog plugin (``hermes_cli.left_core_migration``):
     stripped exactly as when core shipped them, plugin installed or not."""
@@ -252,12 +264,18 @@ def _is_provider_env_blocklisted(name: str, _registered: frozenset | None = None
     """``name`` is a blocklisted provider/tool credential or adapter secret, matched the way the
     platform's environment resolves names: exact plus case-folded. On Windows the environment
     block is case-insensitive, so ``openai_api_key`` IS ``OPENAI_API_KEY``; consistent with
-    ``_is_hermes_internal_secret``, which already folds (``key.upper()``). The per-profile names
-    (adapter secrets, config-declared key holders) default to :func:`_registered_adapter_secret_env`
-    | :func:`_home_declared_key_env`; loops pass ``_registered`` so they are read once per env, not
-    once per key."""
+    ``_is_hermes_internal_secret``, which already folds (``key.upper()``). Secret-source bootstrap
+    tokens resolve at call time (:func:`_secret_source_bootstrap_env_now`): a plugin source
+    registers after this module's import-time snapshots froze, and the scrub paths,
+    env_passthrough's GHSA-rhgp-j443-p4rf re-check and the remote implicit-forward filter all
+    consult here. The per-profile names (adapter secrets, config-declared key holders) default to
+    :func:`_registered_adapter_secret_env` | :func:`_home_declared_key_env`; loops pass
+    ``_registered`` so they are read once per env, not once per key."""
     upper = name.upper()
     if name in _HERMES_PROVIDER_ENV_BLOCKLIST or upper in _HERMES_PROVIDER_ENV_BLOCKLIST:
+        return True
+    now = _secret_source_bootstrap_env_now()
+    if name in now or upper in {n.upper() for n in now}:
         return True
     if _registered is None:
         _registered = _registered_adapter_secret_env() | _home_declared_key_env()

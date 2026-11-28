@@ -30,6 +30,7 @@ from tools.environments.local_env_policy import (
     _home_adapter_secret_env, _home_declared_key_env, _matches_terminal_first_party_prefix,
     _plugin_terminal_env_strip_keys,
     _registered_adapter_secret_env, _registry_adapter_secret_env, _secret_source_bootstrap_env,
+    _secret_source_bootstrap_env_now,
     DEPLOYMENT_STAMP_ENV, strip_profile_gate_env, strip_supervised_process_identity)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
@@ -386,7 +387,10 @@ def _scrub_credentials(env: dict, *, inherit_credentials: bool) -> dict:
     # Credential names fold to uppercase for membership: on Windows the env block
     # itself is case-insensitive, so a lowercase-stored ``gh_token`` IS GH_TOKEN.
     home_secrets = _home_adapter_secret_env()  # one manifest stamp per scrub
-    strip_folded = _ALWAYS_STRIP_FOLDED | {k.upper() for k in _plugin_terminal_env_strip_keys()} | home_secrets
+    # Secret-source bootstrap tokens are Tier 1 at call time: a plugin source registers after
+    # the frozen sets snapped, so its token must strip even under inherit_credentials (#161034).
+    strip_folded = (_ALWAYS_STRIP_FOLDED | {k.upper() for k in _plugin_terminal_env_strip_keys()}
+                    | home_secrets | {k.upper() for k in _secret_source_bootstrap_env_now()})
     registered = _registry_adapter_secret_env() | _home_declared_key_env()  # home_secrets already strip above
     drop_bridge_markers(env)
     for key in list(env):
