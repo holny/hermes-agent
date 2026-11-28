@@ -357,3 +357,50 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+# =========================================================================
+# LIKE fallback ranking (#161060)
+# =========================================================================
+
+class TestLikeFallbackTokenRank:
+    """Short CJK tokens disable the trigram route, and the OR-joined LIKE scan then
+    matched nearly every recent row for such tokens, so ``m.timestamp DESC`` alone
+    decided the order. The fallbacks now rank by distinct tokens matched with recency
+    as the tiebreaker; an explicit newest/oldest sort still leads with the timestamp."""
+
+    def test_short_cjk_tokens_rank_by_match_strength(self, db):
+        """A row matching both 2-char CJK tokens outranks a newer row matching one."""
+        create_session(db, session_id="s-old", source="cli")
+        create_session(db, session_id="s-new", source="cli")
+        append_message(db, "s-old", role="user", content="状態 変更 を確認する", timestamp=100)
+        append_message(db, "s-new", role="user", content="状態 だけを見る", timestamp=200)
+        results = search_messages(db, "状態 変更")
+        assert [r["session_id"] for r in results[:2]] == ["s-old", "s-new"]
+
+    def test_like_fallback_recency_breaks_ties(self, db):
+        """Equal match strength falls back to newest-first."""
+        create_session(db, session_id="s1", source="cli")
+        create_session(db, session_id="s2", source="cli")
+        append_message(db, "s1", role="user", content="状態 その一", timestamp=100)
+        append_message(db, "s2", role="user", content="状態 その二", timestamp=200)
+        results = search_messages(db, "状態")
+        assert results[0]["session_id"] == "s2"
+
+    def test_boolean_or_groups_rank_by_match_strength(self, db):
+        """role=tool scans (the boolean LIKE compiler) rank OR-group matches first on the default sort."""
+        create_session(db, session_id="s-old", source="cli")
+        create_session(db, session_id="s-new", source="cli")
+        append_message(db, "s-old", role="tool", tool_name="web_search", content="状態 変更", timestamp=100)
+        append_message(db, "s-new", role="tool", tool_name="web_search", content="状態", timestamp=200)
+        results = search_messages(db, "状態 OR 変更", role_filter=["tool"])
+        assert [r["session_id"] for r in results[:2]] == ["s-old", "s-new"]
+
+    def test_boolean_or_groups_explicit_newest_stays_timestamp_first(self, db):
+        """An explicit ``sort=newest`` keeps timestamp-first even when another row matches more groups."""
+        create_session(db, session_id="s-old", source="cli")
+        create_session(db, session_id="s-new", source="cli")
+        append_message(db, "s-old", role="tool", tool_name="web_search", content="状態 変更", timestamp=100)
+        append_message(db, "s-new", role="tool", tool_name="web_search", content="状態", timestamp=200)
+        results = search_messages(db, "状態 OR 変更", role_filter=["tool"], sort="newest")
+        assert [r["session_id"] for r in results[:2]] == ["s-new", "s-old"]

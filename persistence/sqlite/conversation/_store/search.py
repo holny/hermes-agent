@@ -133,6 +133,21 @@ def _like_params(term: str) -> list[str]:
     return [f"%{_escape_like(term)}%"] * 3
 
 
+def _like_token_rank(terms: list[str]) -> tuple[str, list[Any]]:
+    """ORDER BY expression + binds ranking a row by how many distinct ``terms`` it matched.
+
+    The LIKE fallbacks run when the trigram route can't (short CJK tokens are normal
+    Japanese/Chinese words); their OR-joined predicate then matches nearly every recent
+    row for such tokens, so ``m.timestamp DESC`` alone decided the order and the source
+    session never surfaced (#161060). Counting each term's any-column boolean keeps
+    recency only as the tiebreaker. Callers guarantee ``terms`` is non-empty. The rank
+    reads the COALESCEd columns: a raw ``NULL`` tool_name/tool_calls would poison the
+    ``+`` sum (``NULL + 1`` is ``NULL``) and sink matching rows.
+    """
+    return (" + ".join(f"({_LIKE_COALESCED_COLUMN_SQL})" for _ in terms),
+            [p for term in terms for p in _like_params(term)])
+
+
 def _strip_cjk_wildcards(raw_query: str) -> str:
     """Drop the trailing prefix wildcard callers append for ASCII ("nimb" -> "nimb*").
 
@@ -579,9 +594,10 @@ def _like_rows(holder: StoreHolder, where: list[str], params: list, *, order_by:
     return [dict(row) for row in holder._read_all(sql, params)]
 
 
-def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str]]:
+def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str], list[str]]:
     """Compile the supported FTS boolean subset into LIKE predicates: terms within an OR
-    group are ANDed (FTS5's implicit conjunction) and ``NOT`` negates the next term."""
+    group are ANDed (FTS5's implicit conjunction) and ``NOT`` negates the next term.
+    The fourth return is the deduped positive (non-negated) term list the caller ranks by."""
     groups: list[list[tuple[str, bool]]] = [[]]
     negate_next = False
     for raw_token in _LIKE_TOKEN_RE.findall(query):
@@ -604,6 +620,7 @@ def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[st
     compiled_groups: list[str] = []
     params: list[Any] = []
     snippet_term: Optional[str] = None
+    positive_terms: list[str] = []
     for group in groups:
         if not group or not any(not negated for _, negated in group):
             continue
@@ -611,23 +628,31 @@ def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[st
         for term, negated in group:
             clauses.append(f"NOT {_LIKE_COALESCED_COLUMN_SQL}" if negated else _LIKE_COALESCED_COLUMN_SQL)
             params.extend(_like_params(term))
+            if not negated and term not in positive_terms:
+                positive_terms.append(term)
             if snippet_term is None and not negated:
                 snippet_term = term
         compiled_groups.append(f"({' AND '.join(clauses)})")
-    return " OR ".join(compiled_groups), params, snippet_term
+    return " OR ".join(compiled_groups), params, snippet_term, positive_terms
 
 
 def _search_messages_like_fallback(
     holder: StoreHolder, query: str, *, limit: int, offset: int, sort: Optional[str], **filters) -> list[dict[str, Any]]:
-    """Search canonical messages while derived FTS state is stale."""
-    predicate, params, snippet_term = _compile_like_boolean_query(query)
+    """Search canonical messages while derived FTS state is stale. Explicit ``newest``/``oldest``
+    keeps timestamp-first ordering (the FTS routes' contract); the default ranks by distinct
+    tokens matched with recency as the tiebreaker, like the CJK LIKE fallback."""
+    predicate, params, snippet_term, positive_terms = _compile_like_boolean_query(query)
     if not predicate or snippet_term is None:
         return []
     where = [f"({predicate})"]
     _search_filter_clauses(where, params, **filters)
-    order = "ASC" if isinstance(sort, str) and sort.strip().lower() == "oldest" else "DESC"
-    return _like_rows(holder, where, [snippet_term, *params, limit, offset],
-                           order_by=f"ORDER BY m.timestamp {order}, m.id {order}", limit_sql="LIMIT ? OFFSET ?")
+    if isinstance(sort, str) and sort.strip().lower() in {"newest", "oldest"}:
+        order = "ASC" if sort.strip().lower() == "oldest" else "DESC"
+        return _like_rows(holder, where, [snippet_term, *params, limit, offset],
+                            order_by=f"ORDER BY m.timestamp {order}, m.id {order}", limit_sql="LIMIT ? OFFSET ?")
+    rank_sql, rank_params = _like_token_rank(positive_terms)
+    return _like_rows(holder, where, [snippet_term, *params, *rank_params, limit, offset],
+                            order_by=f"ORDER BY {rank_sql} DESC, m.timestamp DESC, m.id DESC", limit_sql="LIMIT ? OFFSET ?")
 
 
 def _refresh_fts_stale_state(holder: StoreHolder) -> None:
@@ -719,8 +744,9 @@ def _search_messages_impl(
 ) -> list[dict[str, Any]]:
     """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
     Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
-    projection. ``sort``: None = BM25 rank; "newest"/"oldest" = timestamp then rank (the
-    CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
+    projection. ``sort``: None = BM25 rank on the FTS routes, distinct-tokens-matched on
+    the LIKE fallbacks (recency ties); "newest"/"oldest" = timestamp then rank (the CJK
+    LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
     by default; compaction-archived rows ARE included; ``include_inactive`` = every row.
     ``after_ts``/``before_ts`` bound ``sessions.started_at`` on every route (FTS5, CJK,
     trigram, LIKE fallback, unindexed-gap supplement); so does ``session_ids`` (search
@@ -815,7 +841,9 @@ def _search_cjk(holder: StoreHolder, query: str, wants_unindexed_rows: bool, rou
     """CJK routing: the unicode61 table splits CJK into single characters (false positives,
     missed phrases). Trigram serves >=3 CJK chars per token unless the query wants rows it
     excludes (role='tool', cron/subagent sources); everything else is a LIKE substring scan
-    with one clause per non-operator token so "广西 OR 桂林 OR 漓江" matches each term."""
+    with one clause per non-operator token so "广西 OR 桂林 OR 漓江" matches each term,
+    ranked by distinct tokens matched before recency — a short-CJK OR-scan otherwise
+    degenerates to newest-first (#161060)."""
     raw_query = _strip_cjk_wildcards(query).strip('"').strip()
     match_query = _quote_fts_tokens(raw_query)
     if _trigram_route_ok(holder, raw_query) and not wants_unindexed_rows:
@@ -828,9 +856,13 @@ def _search_cjk(holder: StoreHolder, query: str, wants_unindexed_rows: bool, rou
     filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
                                      "after_ts", "before_ts", "session_ids", "compacted_in_session")}
     _search_filter_clauses(like_where, like_params, **filters)
+    # Rank by distinct tokens matched, recency only as the tiebreaker: with short CJK
+    # tokens the OR-scan matches nearly every recent row, so recency alone decided.
+    rank_sql, rank_params = _like_token_rank(non_op_tokens)
     # instr() for the snippet uses the first search token.
-    return _like_rows(holder, like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],
-                           order_by="ORDER BY m.timestamp DESC", limit_sql="LIMIT ? OFFSET ?")
+    return _like_rows(holder, like_where,
+                            [non_op_tokens[0], *like_params, *rank_params, route["limit"], route["offset"]],
+                            order_by=f"ORDER BY {rank_sql} DESC, m.timestamp DESC, m.id DESC", limit_sql="LIMIT ? OFFSET ?")
 
 
 def _search_unindexed_gap(holder: StoreHolder, fts_query: str, limit: int, **filters) -> list[dict[str, Any]]:
