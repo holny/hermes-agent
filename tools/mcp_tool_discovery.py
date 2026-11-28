@@ -341,9 +341,20 @@ async def _discover_and_register_server(name: str, config: dict) -> list[str]:
         server = claimed[0] if claimed else None
         task = server._task if server is not None else None
         task_cancelling = task.cancelling() if task is not None and hasattr(task, "cancelling") else 0
-        if (server is not None and server._error is not None and task is not None
-                and not task.done() and not task_cancelling):
+        our_cancellation = asyncio.current_task().cancelling() if (our := asyncio.current_task()) else 0
+        alive = task is not None and not task.done()
+        if server is not None and alive and (server._error is not None or our_cancellation > 0):
             # Recoverable park: the run task self-probes, so adopt it for shutdown/revival.
+            # Reached two ways: it already failed recoverably, or OUR frame was cancelled while
+            # the spawn was still in flight (a discovery-pass budget expiry cancels the pass but
+            # not the child). In that cancelled frame `await server.shutdown()` cannot be
+            # trusted to finish its teardown, and skipping it left the spawned process without
+            # a managed entry: no lifecycle recycle, no retry, no re-registration — alive until
+            # the gateway exits (#158884). A run task already carrying start()'s own
+            # cancellation request still belongs here: it is not done yet, and an adopted
+            # entry (status, shutdown_mcp_servers, lifecycle) beats an invisible ghost. The
+            # adopted task revives and re-registers its tools on its own (transport reconnect /
+            # health self-probe), and the lifecycle limits apply to it again.
             _adopt_server(name, server)
         elif server is not None:
             await server.shutdown()
